@@ -722,6 +722,14 @@
       "ClientCredentials": 3600,
       "IdToken": 3600,
       "RefreshToken": 86400
-  }
+  },
   */
+
+  /* Configuration for OpenID plugin */
+  "ep_openid_connect": {
+    "issuer": "${OPENID_ISSUER}",
+    "client_id": "${OPENID_CLIENT_ID}",
+    "client_secret": "${OPENID_CLIENT_SECRET}",
+    "base_url": "${OPENID_BASE_URL}"
+  }
 }
