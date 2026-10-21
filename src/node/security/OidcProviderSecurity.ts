@@ -1,0 +1,209 @@
+import crypto from 'node:crypto';
+
+/**
+ * Security helpers for the embedded OIDC provider (`OAuth2Provider.ts`).
+ *
+ * Kept in a dependency-light module (only `node:crypto`) so the pure decisions
+ * can be unit-tested without constructing an `oidc-provider` instance.
+ */
+
+// Domain-separation label so the derived cookie key is cryptographically
+// unrelated to any other use of the session secret. The trailing NUL keeps the
+// label from ambiguously running into the appended secret.
+export const COOKIE_KEY_DERIVATION_LABEL = 'etherpad-oidc-provider-cookie-signing-key\0';
+
+/**
+ * Resolve the cookie-signing keys for the embedded OIDC provider.
+ *
+ * oidc-provider signs its short-lived interaction/session/grant cookies
+ * (`_interaction`, `_interaction_resume`, `_grant`, `_session`) with an HMAC
+ * keyed by these values. Shipping a hardcoded key (historically `['oidc']`) let
+ * anyone with the public source forge valid `.sig` cookies, defeating the
+ * provider's cookie-integrity guarantee. Reported by `meifukun`.
+ *
+ * Resolution order:
+ *   1. An explicit operator-supplied `settings.sso.cookieKeys` array — use this
+ *      for controlled rotation: `[newKey, ...oldKeys]`.
+ *   2. The live secrets array of a DB-backed `SecretRotator` (the same mechanism
+ *      the Express session-cookie stack uses). This is the default path: it is
+ *      stable across restarts, shared across horizontally-scaled pods via the
+ *      database, and rotates automatically. The array is returned BY REFERENCE
+ *      so a later in-place rotation propagates to oidc-provider/keygrip without
+ *      reconstructing the provider.
+ *   3. A value derived from the persisted Etherpad session secret
+ *      (`SESSIONKEY.txt`) via a domain-separated SHA-256 — used when rotation is
+ *      disabled but a static session key exists. Stable across restarts/pods,
+ *      never committed to source.
+ *   4. As a last resort (no key material at all), an ephemeral per-process
+ *      random key. The integrity boundary holds, but interactions won't survive
+ *      a restart or span multiple pods.
+ */
+export const resolveOidcCookieKeys = (
+  opts: {cookieKeys?: unknown, rotatedSecrets?: string[] | null, sessionKey?: string | null},
+): string[] => {
+  const {cookieKeys, rotatedSecrets, sessionKey} = opts;
+
+  if (Array.isArray(cookieKeys)) {
+    const usable = cookieKeys.filter((k): k is string => typeof k === 'string' && k.length > 0);
+    if (usable.length > 0) return usable;
+  }
+
+  // Return the rotator's array by reference (do not copy/filter) so in-place
+  // rotation is observed live by keygrip.
+  if (Array.isArray(rotatedSecrets) &&
+      rotatedSecrets.some((k) => typeof k === 'string' && k.length > 0)) {
+    return rotatedSecrets;
+  }
+
+  if (typeof sessionKey === 'string' && sessionKey.length > 0) {
+    const derived = crypto.createHash('sha256')
+        .update(COOKIE_KEY_DERIVATION_LABEL)
+        .update(sessionKey)
+        .digest('hex');
+    return [derived];
+  }
+
+  return [crypto.randomBytes(32).toString('hex')];
+};
+
+/**
+ * Origin allow-list decision for the embedded OIDC provider's CORS-enabled
+ * endpoints (`/oidc/token`, `/oidc/me`, ...). oidc-provider invokes
+ * `clientBasedCORS(ctx, origin, client)` for every cross-origin request;
+ * returning `true` unconditionally (the historical behavior) reflected ANY
+ * `Origin` into `Access-Control-Allow-Origin`, letting unregistered origins read
+ * token/userinfo responses that use non-cookie credentials (Authorization
+ * headers, POST-body client credentials). Reported by `meifukun`.
+ *
+ * An origin is allowed only when it exactly matches the origin (scheme + host +
+ * port) of one of the client's registered redirect URIs.
+ */
+export const isOriginAllowedForOidcClient = (
+  origin: string | undefined | null,
+  client: {redirectUris?: unknown} | undefined | null,
+): boolean => {
+  if (!origin || !client) return false;
+  const uris = (client as {redirectUris?: unknown}).redirectUris;
+  if (!Array.isArray(uris)) return false;
+  return uris.some((uri: unknown) => {
+    if (typeof uri !== 'string') return false;
+    try {
+      return new URL(uri).origin === origin;
+    } catch {
+      return false;
+    }
+  });
+};
+
+/**
+ * Constant-time string comparison. Unequal-length inputs short-circuit to
+ * false; callers apply a uniform failure delay, which covers that difference.
+ */
+const constantTimeEquals = (a: string, b: string): boolean => {
+  const ba = Buffer.from(String(a), 'utf8');
+  const bb = Buffer.from(String(b), 'utf8');
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+};
+
+/**
+ * Decide whether an interactive OIDC login should be accepted.
+ *
+ * The password comparison used to run the stored value through `String()`, so
+ * an account with no `password` property compared against the literal
+ * `"undefined"`, and one with `"password": null` against `"null"`. Submitting
+ * that literal logged the account in and yielded a JWT carrying its `admin`
+ * claim. Accounts without a usable password arise in practice: the official
+ * container leaves `password` null when `ADMIN_PASSWORD` is unset, and an
+ * `ep_hash_auth` entry replaces `password` with `hash`.
+ *
+ * `webaccess.ts` already fails closed on a nullish password (see the
+ * "login fails if password is nullish" spec); this is the same rule for the
+ * OIDC interaction path. A non-string password (a `hash` entry, or a
+ * misconfigured object/number) is also refused rather than coerced: those
+ * accounts authenticate through the `authenticate` hook, which this path does
+ * not consult. Reported by Wenhao Wu (Southeast University).
+ *
+ * @param users The `settings.users` map.
+ * @param login Submitted username.
+ * @param password Submitted password.
+ * @returns The matched account, or `null` when the login must be refused.
+ */
+export const verifyInteractiveLogin = (
+  users: Readonly<Record<string, unknown>> | null | undefined,
+  login: unknown,
+  password: unknown,
+): (Record<string, unknown> & {username: string}) | null => {
+  if (users == null) return null;
+  const loginStr = String(login ?? '');
+  const passwordStr = String(password ?? '');
+  // Own properties only: `__proto__`, `constructor` and friends are not accounts.
+  if (!Object.prototype.hasOwnProperty.call(users, loginStr)) return null;
+  const user = users[loginStr] as {password?: unknown} | null | undefined;
+  if (user == null) return null;
+  // Fail closed unless the account has a real scalar password to compare.
+  // Numbers and booleans are accepted because the settings loader coerces
+  // env-var values (`ADMIN_PASSWORD=123456` arrives as the number 123456,
+  // #8263); HTTP Basic in webaccess.ts compares those via toString() too.
+  // An empty string is not a usable password: it authenticates anyone who
+  // submits nothing, which is never what an operator means by `"password": ""`.
+  const stored = user.password;
+  const storedOk = typeof stored === 'string' || typeof stored === 'boolean' ||
+      (typeof stored === 'number' && Number.isFinite(stored));
+  if (!storedOk || String(stored) === '') return null;
+  if (!constantTimeEquals(passwordStr, String(stored))) return null;
+  return {...(user as Record<string, unknown>), username: loginStr};
+};
+
+/**
+ * Private claim the embedded provider stamps on client_credentials access
+ * tokens. The HTTP API used to infer the grant from the token's `sub`: any
+ * token whose `sub` equalled a configured `client_id` was treated as a
+ * client_credentials token and skipped the `admin === true` check. A user
+ * whose username collided with a client ID therefore got admin API access
+ * with a non-admin authorization_code token. Reported by Yves Soete of
+ * Blacksight LLC.
+ */
+export const GRANT_CLAIM = 'etherpad_grant';
+export const CLIENT_CREDENTIALS_GRANT = 'client_credentials';
+
+/**
+ * Extra claims for a client_credentials token: the operator-configured
+ * `extraParams` of the matching client, plus the grant marker. The marker is
+ * set last so a configured extraParam cannot override or forge it.
+ */
+export const clientCredentialsClaims = (
+  clients: unknown,
+  clientId: string | undefined,
+): Record<string, unknown> => {
+  const claims: Record<string, unknown> = {};
+  if (Array.isArray(clients)) {
+    for (const client of clients) {
+      if (client == null || client.client_id !== clientId) continue;
+      if (!Array.isArray(client.extraParams)) continue;
+      for (const param of client.extraParams) {
+        if (param == null || param.name === GRANT_CLAIM) continue;
+        claims[param.name] = param.value;
+      }
+    }
+  }
+  claims[GRANT_CLAIM] = CLIENT_CREDENTIALS_GRANT;
+  return claims;
+};
+
+/**
+ * Decide whether a signature-verified API access token may call the HTTP API.
+ *
+ * A client_credentials token is recognised only by the grant marker that the
+ * provider itself signs in, and its `sub` must still name a configured client.
+ * Every other token is a user token and needs `admin` to be strictly `true`.
+ */
+export const isApiTokenAuthorized = (
+  payload: Record<string, unknown> | null | undefined,
+  clientIds: readonly string[],
+): boolean => {
+  if (payload == null) return false;
+  if (payload[GRANT_CLAIM] === CLIENT_CREDENTIALS_GRANT) {
+    return typeof payload.sub === 'string' && clientIds.includes(payload.sub);
+  }
+  return payload.admin === true;
+};

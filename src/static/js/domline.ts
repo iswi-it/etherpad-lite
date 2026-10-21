@@ -27,6 +27,11 @@ const Security = require('./security');
 const hooks = require('./pluginfw/hooks');
 const _ = require('./underscore');
 const lineAttributeMarker = require('./linestylefilter').lineAttributeMarker;
+
+// Elements that give a line its own AT semantics, so it must not also be
+// exposed as role="paragraph" (#7778).
+const semanticBlockSelector =
+    'p,ul,ol,li,dl,h1,h2,h3,h4,h5,h6,pre,blockquote,table,figure,hr';
 const noop = () => {};
 
 
@@ -62,8 +67,6 @@ domline.createDomLine = (nonEmpty, doesWrap, optBrowser, optDocument) => {
 
   if (document) {
     result.node = document.createElement('div');
-    // JAWS and NVDA screen reader compatibility. Only needed if in a real browser.
-    result.node.setAttribute('aria-live', 'assertive');
   } else {
     result.node = {
       innerHTML: '',
@@ -104,12 +107,21 @@ domline.createDomLine = (nonEmpty, doesWrap, optBrowser, optDocument) => {
             postHtml = `</li></ul>${postHtml}`;
           } else {
             if (start) { // is it a start of a list with more than one item in?
-              if (Number.parseInt(start[1]) === 1) { // if its the first one at this level?
+              // The `start` value comes verbatim from the attribute pool (which
+              // an attacker can populate via a crafted `.etherpad` import), so it
+              // must never be interpolated raw into the markup. An <ol> start is
+              // only ever an integer: coerce it and HTML-escape it defensively so
+              // a value such as `1><svg/onload=...>` cannot break out of the tag.
+              const startNum = Number.parseInt(start[1]);
+              if (startNum === 1) { // if its the first one at this level?
                 // Add start class to DIV node
                 lineClass = `${lineClass} ` + `list-start-${listType}`;
               }
+              const startAttr = Number.isNaN(startNum)
+                ? ''
+                : ` start="${Security.escapeHTMLAttribute(String(startNum))}"`;
               preHtml +=
-                `<ol start=${start[1]} class="list-${Security.escapeHTMLAttribute(listType)}"><li>`;
+                `<ol${startAttr} class="list-${Security.escapeHTMLAttribute(listType)}"><li>`;
             } else {
               // Handles pasted contents into existing lists
               preHtml += `<ol class="list-${Security.escapeHTMLAttribute(listType)}"><li>`;
@@ -142,8 +154,13 @@ domline.createDomLine = (nonEmpty, doesWrap, optBrowser, optDocument) => {
     }
     if (cls.indexOf('tag') >= 0) {
       cls = cls.replace(/(^| )tag:(\S+)/g, (x0, space, tag) => {
-        if (!simpleTags) simpleTags = [];
-        simpleTags.push(tag.toLowerCase());
+        // The tag name is emitted raw as `<${tag}>`, so only accept a bare
+        // element name; anything else (e.g. `img/src=x/onerror=...` forged via
+        // an attribute-pool value) is dropped rather than rendered.
+        if (/^[a-z][a-z0-9-]*$/i.test(tag)) {
+          if (!simpleTags) simpleTags = [];
+          simpleTags.push(tag.toLowerCase());
+        }
         return space + tag;
       });
     }
@@ -220,6 +237,20 @@ domline.createDomLine = (nonEmpty, doesWrap, optBrowser, optDocument) => {
       result.node.innerHTML = curHTML;
     }
     if (lineClass != null) result.node.className = lineClass;
+    // Plain lines are <div>s, which AT exposes as anonymous generic
+    // containers, flattening the whole pad into one run of text. Expose each
+    // one as a paragraph so screen readers can step through the pad line by
+    // line (and reach the links inside each line). See #7778.
+    // Lines whose markup already carries block semantics (lists, headings from
+    // ep_headings2, etc.) keep those instead. Inline or styling-only wrappers
+    // added by plugins don't count, so those lines stay paragraphs.
+    if (document && result.node.setAttribute) {
+      if (result.node.querySelector(semanticBlockSelector)) {
+        if (result.node.hasAttribute('role')) result.node.removeAttribute('role');
+      } else if (result.node.getAttribute('role') !== 'paragraph') {
+        result.node.setAttribute('role', 'paragraph');
+      }
+    }
 
     hooks.callAll('acePostWriteDomLineHTML', {
       node: result.node,
@@ -233,12 +264,15 @@ domline.createDomLine = (nonEmpty, doesWrap, optBrowser, optDocument) => {
 domline.processSpaces = (s, doesWrap) => {
   if (s.indexOf('<') < 0 && !doesWrap) {
     // short-cut
-    return s.replace(/ /g, '&nbsp;');
+    return s.replace(/[ \u00a0]/g, '&nbsp;');
   }
   const parts = [];
-  s.replace(/<[^>]*>?| |[^ <]+/g, (m) => {
+  s.replace(/<[^>]*>?|[ \u00a0]|[^ \u00a0<]+/g, (m) => {
     parts.push(m);
   });
+  // U+00A0 is content for run-bookkeeping - it terminates a space run
+  // just like a word character would, so runs of regular spaces adjacent
+  // to a nbsp are not miscounted as one long run (issue #3037).
   if (doesWrap) {
     let endOfLine = true;
     let beforeSpace = false;
@@ -272,6 +306,9 @@ domline.processSpaces = (s, doesWrap) => {
         parts[i] = '&nbsp;';
       }
     }
+  }
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] === '\u00a0') parts[i] = '&nbsp;';
   }
   return parts.join('');
 };

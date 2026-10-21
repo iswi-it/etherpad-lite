@@ -21,12 +21,24 @@ jobs:
   releases:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      # Short-lived token from the "etherpad-release-bot" GitHub App; app
+      # credentials don't expire like a PAT does. The built-in GITHUB_TOKEN
+      # won't do: tags pushed with it don't trigger the Docker, .deb, snap and
+      # GitHub Release workflows.
+      - name: Get release token from GitHub App
+        id: app-token
+        uses: actions/create-github-app-token@v3
         with:
-            repository: ether/etherpad-lite
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ether
+          repositories: etherpad,ether.github.com
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+            repository: ether/etherpad
             path: etherpad
-            token: '${{ secrets.ETHER_RELEASE_TOKEN }}'
+            token: ${{ steps.app-token.outputs.token }}
             fetch-depth: '0'
             fetch-tags: 'true'
       - name: Checkout master
@@ -42,30 +54,37 @@ jobs:
           git checkout develop
           git reset --hard origin/develop
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ether/ether.github.com
           path: ether.github.com
-          token: '${{ secrets.ETHER_RELEASE_TOKEN }}'
-      - uses: actions/cache@v5
-        name: Setup gnpm cache
-        if: always()
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/cache@v6
+        name: Cache pnpm store
         with:
-          path: |
-            ${{ env.STORE_PATH }}
-            ~/.local/share/gnpm
-            ~/.cache/ms-playwright
-            /usr/local/bin/gnpm
-            /usr/local/bin/gnpm-0.0.12
-          key: ${{ runner.os }}-gnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          path: ${{ env.PNPM_HOME }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
           restore-keys: |
-            ${{ runner.os }}-gnpm-store-
-      - name: Setup gnpm
-        uses: SamTV12345/gnpm-setup@main
+            ${{ runner.os }}-pnpm-store-
+      - uses: pnpm/action-setup@v6.1.0
+        name: Install pnpm
         with:
-          version: 0.0.12
+          run_install: false
+          # Repo is checked out into ./etherpad, so the action can't find
+          # packageManager in a root package.json.
+          package_json_file: etherpad/package.json
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: etherpad/pnpm-lock.yaml
       - name: Install dependencies ether.github.com
-        run: gnpm install --frozen-lockfile
+        # ether.github.com depends on sharp (Next.js image pipeline), whose
+        # install script must run to fetch the platform binary. pnpm
+        # turned ignored-builds into an error; allow all builds for this
+        # external repo since we don't control its pnpm-workspace.yaml.
+        run: pnpm install --frozen-lockfile --config.dangerously-allow-all-builds=true
         working-directory: ether.github.com
       - name: Set git user
         run: |
@@ -75,15 +94,15 @@ jobs:
         with:
           ruby-version: 2.7
 
-      - uses: reitzig/actions-asciidoctor@v2.0.2
+      - uses: reitzig/actions-asciidoctor@v2.0.6
         with:
           version: 2.0.18
       - name: Prepare release
         working-directory: etherpad
         run: |
           cd bin
-          gnpm install
-          gnpm run release ${{ inputs.release_type }}
+          pnpm install
+          pnpm run release ${{ inputs.release_type }}
       - name: Push after release
         working-directory: etherpad
         run: |

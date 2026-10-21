@@ -1,0 +1,104 @@
+'use strict';
+
+// Regression tests for ether/etherpad#7911.
+//
+// The official Docker image installs pnpm directly (corepack was dropped for
+// Node 25+). Standalone pnpm still honours the "packageManager" pin in
+// package.json: when the pnpm baked into the image differs from that pin, pnpm
+// treats every invocation — including the informational `pnpm --version` probe
+// Etherpad runs at startup — as a request to self-provision the pinned build.
+// With no outbound network (air-gapped / behind a corporate firewall) that
+// download fails and pnpm exits non-zero, surfacing as `Failed to get pnpm
+// version` and breaking offline boots.
+//
+// The image and the pin are kept in sync, so the guard is belt-and-suspenders
+// rather than strictly required. It exists to neutralise any future gap: if the
+// image pnpm ever drifts from the "packageManager" pin again, the Dockerfile
+// must set pnpm_config_pm_on_fail=ignore so pnpm uses the installed version
+// instead of reaching for the network. This test fails if that guard is dropped
+// while a version gap exists.
+
+const assert = require('assert').strict;
+import fs from 'fs';
+import path from 'path';
+
+const repoRoot = path.join(__dirname, '../../../../');
+const readRepoFile = (rel: string) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+
+describe(__filename, function () {
+  describe('Docker pnpm offline guard (issue #7911)', function () {
+    let dockerfile: string;
+    let imagePnpm: string;
+    let pinPnpm: string;
+    let guardPresent: boolean;
+
+    before(function () {
+      dockerfile = readRepoFile('Dockerfile');
+
+      const argMatch = dockerfile.match(/^ARG PnpmVersion=(\S+)/m);
+      assert.ok(argMatch, 'Dockerfile must declare `ARG PnpmVersion=<version>`');
+      imagePnpm = argMatch![1];
+
+      const pkg = JSON.parse(readRepoFile('package.json'));
+      const pinMatch = String(pkg.packageManager || '').match(/^pnpm@(.+)$/);
+      assert.ok(pinMatch, `expected packageManager "pnpm@<version>", got "${pkg.packageManager}"`);
+      pinPnpm = pinMatch![1];
+
+      // The guard only protects runtime if it lives in the `build` stage, which
+      // the development/production runtime stages inherit from. The same ENV in
+      // the throwaway `adminbuild` stage would NOT reach runtime, so scope the
+      // check to the build stage block (from `FROM ... AS build` to the next
+      // `FROM`) rather than matching anywhere in the file.
+      const buildStage = dockerfile.match(
+          /^FROM\s+\S+\s+AS\s+build\b[\s\S]*?(?=^FROM\s)/m);
+      assert.ok(buildStage, 'Dockerfile must define a `FROM ... AS build` stage');
+      guardPresent = /ENV\s+pnpm_config_pm_on_fail=ignore/.test(buildStage![0]);
+    });
+
+    it('neutralises any pnpm version gap so offline boots do not self-provision', function () {
+      // The actual safety property: a mismatch between the image pnpm and the
+      // package.json pin is only safe when pm_on_fail=ignore is set. (If they
+      // are ever realigned, the guard becomes belt-and-suspenders, not required.)
+      if (imagePnpm !== pinPnpm) {
+        assert.ok(guardPresent,
+            `Dockerfile pnpm ${imagePnpm} differs from package.json pnpm@${pinPnpm}, ` +
+            'but pnpm_config_pm_on_fail=ignore is not set — pnpm will try to ' +
+            'self-provision the pinned version and break offline/air-gapped ' +
+            'startup (issue #7911).');
+      }
+    });
+
+    it('sets pnpm_config_pm_on_fail=ignore in the runtime-inherited build stage', function () {
+      assert.ok(guardPresent,
+          'The `build` stage must set pnpm_config_pm_on_fail=ignore (it is ' +
+          'inherited by the development/production runtime stages) so runtime ' +
+          'pnpm calls — the startup probe, the updater pnpm check — do not fail ' +
+          'closed when offline (issue #7911). Setting it only in `adminbuild` ' +
+          'would not reach runtime.');
+    });
+  });
+
+  describe('PnpmVersion build-arg scope (issue #8210)', function () {
+    // Docker resolves a `ARG` declared before the first `FROM` only in the
+    // "global scope" that precedes every stage. Inside a stage it expands to an
+    // empty string unless the stage redeclares it, so `npm install -g pnpm@${PnpmVersion}`
+    // silently becomes `npm install -g pnpm@` (i.e. latest) and a version passed
+    // via --build-arg is ignored. Each stage that installs pnpm must redeclare
+    // the ARG.
+    it('redeclares ARG PnpmVersion in every stage that installs pnpm', function () {
+      const dockerfile = readRepoFile('Dockerfile');
+      // Split into `FROM`-delimited stages, keeping each stage's text.
+      const stages = dockerfile.split(/^(?=FROM\s)/m).map((s) => s.trim()).filter(Boolean);
+      const offenders = stages.filter((stage) => {
+        if (!/npm install -g pnpm@\$\{PnpmVersion\}/.test(stage)) return false;
+        // Confirm the ARG is declared *in this stage*, not merely referenced.
+        return !/^ARG PnpmVersion\b/m.test(stage);
+      });
+      assert.equal(offenders.length, 0,
+          'Each build stage that runs `npm install -g pnpm@${PnpmVersion}` must ' +
+          'redeclare `ARG PnpmVersion`; without it ${PnpmVersion} is empty and ' +
+          'the pinned version from --build-arg is ignored (issue #8210). ' +
+          `Offending stage(s): ${offenders.map((s) => s.split('\n')[0]).join(', ')}`);
+    });
+  });
+});

@@ -8,7 +8,16 @@ import {IncomingForm} from 'formidable'
 import express from 'express';
 import {format} from 'url'
 import {ParsedUrlQuery} from "node:querystring";
-import {MapArrayType} from "../types/MapType";
+import {verifyInteractiveLogin, resolveOidcCookieKeys, isOriginAllowedForOidcClient, clientCredentialsClaims} from "./OidcProviderSecurity";
+import SecretRotator from "./SecretRotator";
+
+// Held at module scope so the rotator (and its refresh timer) is not garbage
+// collected for the lifetime of the process, mirroring express.ts.
+let oidcCookieSecretRotator: SecretRotator | null = null;
+
+// Small fixed delay applied to every failed interactive login, mirroring
+// webaccess.authnFailureDelayMs, so failures take a consistent amount of time.
+const OAUTH_LOGIN_FAILURE_DELAY_MS = 1000;
 
 const configuration: Configuration = {
     scopes: ['openid', 'profile', 'email'],
@@ -53,9 +62,13 @@ const configuration: Configuration = {
         profile: ['name'],
         admin: ['admin']
     },
-    cookies: {
-      keys: ['oidc'],
-    },
+    // NOTE: cookies.keys is deliberately NOT set here. A committed literal key
+    // (historically ['oidc']) lets anyone with the public source forge valid
+    // OIDC provider `.sig` cookies. The real key material is resolved at
+    // provider-construction time in expressCreateServer() via
+    // resolveOidcCookieKeys(), which prefers an operator-supplied
+    // settings.sso.cookieKeys and otherwise derives a secret, stable key from
+    // the persisted session secret. See OidcProviderSecurity.ts.
     features:{
       devInteractions: {enabled: false},
     },
@@ -77,8 +90,39 @@ export const expressCreateServer = async (hookName: string, args: ArgsExpressTyp
     publicKeyExported = publicKey
     privateKeyExported = privateKey
 
+    // Resolve the OIDC provider's cookie-signing keys. Never a committed literal.
+    // When the operator hasn't pinned settings.sso.cookieKeys and cookie key
+    // rotation is enabled (the default), reuse the same DB-backed SecretRotator
+    // mechanism as the Express session cookies so the key is stable across
+    // restarts and shared across horizontally-scaled pods. `settings.sessionKey`
+    // is commonly null under default rotation settings, so relying on it alone
+    // would hand the provider an unstable per-process random key.
+    const operatorCookieKeys = (settings.sso as {cookieKeys?: unknown}).cookieKeys;
+    const hasOperatorKeys = Array.isArray(operatorCookieKeys) &&
+        operatorCookieKeys.some((k) => typeof k === 'string' && k.length > 0);
+    const {keyRotationInterval, sessionLifetime} = settings.cookie;
+    let rotatedSecrets: string[] | null = null;
+    if (!hasOperatorKeys && keyRotationInterval && sessionLifetime) {
+        if (oidcCookieSecretRotator == null) {
+            oidcCookieSecretRotator = new SecretRotator(
+                'oidcCookieSecrets', keyRotationInterval, sessionLifetime, settings.sessionKey);
+            await oidcCookieSecretRotator.start();
+        }
+        rotatedSecrets = oidcCookieSecretRotator.secrets;
+    }
+
     const oidc = new Provider(settings.sso.issuer, {
-        ...configuration, jwks: {
+        ...configuration,
+        cookies: {
+            // Secret, deployment-stable signing keys — never a committed literal.
+            // See resolveOidcCookieKeys().
+            keys: resolveOidcCookieKeys({
+                cookieKeys: operatorCookieKeys,
+                rotatedSecrets,
+                sessionKey: settings.sessionKey,
+            }),
+        },
+        jwks: {
             keys: [
                 privateKeyJWK
             ],
@@ -112,9 +156,12 @@ export const expressCreateServer = async (hookName: string, args: ArgsExpressTyp
           },
             jwtResponseModes: {enabled: true},
         },
-        clientBasedCORS: (ctx, origin, client) => {
-          return true
-        },
+        clientBasedCORS: (ctx, origin, client) =>
+          // Only allow cross-origin reads from an origin registered as one of
+          // the client's redirect URIs. Returning `true` unconditionally
+          // reflected any Origin into Access-Control-Allow-Origin. See
+          // isOriginAllowedForOidcClient().
+          isOriginAllowedForOidcClient(origin, client as {redirectUris?: unknown}),
         extraParams: [],
         extraTokenClaims: async (ctx, token) => {
             if(token.kind === 'AccessToken') {
@@ -136,18 +183,9 @@ export const expressCreateServer = async (hookName: string, args: ArgsExpressTyp
                     admin: account?.is_admin
                 };
             } else if (token.kind === "ClientCredentials") {
-                let extraParams: MapArrayType<string> = {}
-
-                settings.sso.clients && settings.sso.clients
-                    .filter((client:any) => client.client_id === token.clientId)
-                    .forEach((client:any) => {
-                    if(client.extraParams !== undefined) {
-                        client.extraParams.forEach((param:any) => {
-                            extraParams[param.name] = param.value
-                        })
-                    }
-                })
-                return extraParams
+                // Marks the token as client_credentials for the HTTP API; see
+                // isApiTokenAuthorized().
+                return clientCredentialsClaims(settings.sso.clients, token.clientId)
             }
         },
         clients: settings.sso.clients
@@ -171,21 +209,23 @@ export const expressCreateServer = async (hookName: string, args: ArgsExpressTyp
                             admin: boolean;
                         }
                     }
-                    const usersArray1 = Object.keys(users).map((username) => ({
-                        username,
-                        ...users[username]
-                    }));
-                    const account = usersArray1.find((user) => user.username === login as unknown as string && user.password === password as unknown as string);
+                    // Own-property lookup plus a constant-time compare that
+                    // fails closed when the account has no usable string
+                    // password (missing, null, or an ep_hash_auth `hash`).
+                    const account = verifyInteractiveLogin(users, login, password);
                     if (!account) {
+                        // Apply the failure delay and stop here (explicit break)
+                        // so a failed login never reaches the grant branch.
+                        await new Promise((resolve) =>
+                            setTimeout(resolve, OAUTH_LOGIN_FAILURE_DELAY_MS));
                         res.setHeader('Content-Type', 'application/json');
                         res.end(JSON.stringify({error: "Invalid login"}));
+                        break;
                     }
 
-                    if (account) {
-                        await oidc.interactionFinished(req, res, {
-                            login: {accountId: account.username}
-                        }, {mergeWithLastSubmission: false});
-                    }
+                    await oidc.interactionFinished(req, res, {
+                        login: {accountId: account.username}
+                    }, {mergeWithLastSubmission: false});
                     break;
                 }
                 case 'consent': {

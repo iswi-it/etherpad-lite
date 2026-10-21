@@ -20,15 +20,16 @@
  */
 
 import {MapArrayType} from "../types/MapType";
-import { jwtDecode } from "jwt-decode";
 const api = require('../db/API');
 const padManager = require('../db/PadManager');
 import settings from '../utils/Settings';
 import createHTTPError from 'http-errors';
 import {Http2ServerRequest} from "node:http2";
 import {publicKeyExported} from "../security/OAuth2Provider";
+import {isApiTokenAuthorized} from "../security/OidcProviderSecurity";
 import {jwtVerify} from "jose";
 import {APIFields, apikey} from './APIKeyHandler'
+import crypto from 'node:crypto';
 // a list of all functions
 const version:MapArrayType<any> = {};
 
@@ -53,7 +54,7 @@ version['1'] = {
   setHTML: ['padID', 'html'],
   getRevisionsCount: ['padID'],
   getLastEdited: ['padID'],
-  deletePad: ['padID'],
+  deletePad: ['padID', 'deletionToken'],
   getReadOnlyID: ['padID'],
   setPublicStatus: ['padID', 'publicStatus'],
   getPublicStatus: ['padID'],
@@ -142,9 +143,14 @@ version['1.3.0'] = {
   setText: ['padID', 'text', 'authorId'],
 };
 
+version['1.3.1'] = {
+  ...version['1.3.0'],
+  compactPad: ['padID', 'keepRevisions'],
+  anonymizeAuthor: ['authorID'],
+};
 
 // set the latest available API version here
-exports.latestApiVersion = '1.3.0';
+exports.latestApiVersion = '1.3.1';
 
 // exports the versions so it can be used by the new Swagger endpoint
 exports.version = version;
@@ -174,27 +180,36 @@ exports.handle = async function (apiVersion: string, functionName: string, field
 
   if (apikey !== null && apikey.trim().length > 0) {
     fields.apikey = fields.apikey || fields.api_key || fields.authorization;
-    // API key is configured, check if it is valid
-    if (fields.apikey !== apikey!.trim()) {
+    // Constant-time compare — see crypto.timingSafeEqual docs.
+    const provided = Buffer.from(String(fields.apikey ?? ''), 'utf8');
+    const want = Buffer.from(apikey!.trim(), 'utf8');
+    const ok = provided.length === want.length &&
+        crypto.timingSafeEqual(provided, want);
+    if (!ok) {
       throw new createHTTPError.Unauthorized('no or wrong API Key');
     }
   } else {
-    if(!req.headers.authorization) {
+    if (!req.headers.authorization) {
       throw new createHTTPError.Unauthorized('no or wrong API Key');
     }
     try {
-      const clientIds: string[] = settings.sso.clients?.map((client: {client_id: string}) => client.client_id) ?? [];
-      const jwtToCheck = req.headers.authorization.replace("Bearer ", "")
-      const payload = jwtDecode(jwtToCheck)
-      // client_credentials
-      if (clientIds.includes(<string>payload.sub)) {
-        await jwtVerify(jwtToCheck, publicKeyExported!, {algorithms: ['RS256']})
-      } else {
-        // authorization_code
-        await jwtVerify(jwtToCheck, publicKeyExported!, {algorithms: ['RS256'],
-          requiredClaims: ["admin"]})
+      const clientIds: string[] = settings.sso.clients?.map(
+          (client: {client_id: string}) => client.client_id) ?? [];
+      const jwtToCheck = req.headers.authorization.replace('Bearer ', '');
+      // Verify the JWT signature first, then read claims off the verified
+      // payload only.
+      const {payload: verified} = await jwtVerify(
+          jwtToCheck, publicKeyExported!, {algorithms: ['RS256']});
+      // The grant is identified by a marker the provider signs into
+      // client_credentials tokens, never by comparing `sub` to client IDs:
+      // a username equal to a client ID would otherwise skip the admin check.
+      if (!isApiTokenAuthorized(verified, clientIds)) {
+        throw new createHTTPError.Unauthorized(
+            'admin claim missing or not true');
       }
     } catch (e) {
+      // Single error string regardless of the underlying failure so we
+      // don't leak which check rejected the token.
       throw new createHTTPError.Unauthorized('no or wrong OAuth token');
     }
   }

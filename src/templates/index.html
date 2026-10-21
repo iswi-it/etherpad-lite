@@ -1,9 +1,16 @@
+<%
+  var langs = require("ep_etherpad-lite/node/hooks/i18n").availableLangs;
+  var renderLang = (req && typeof req.acceptsLanguages === 'function'
+    && req.acceptsLanguages(Object.keys(langs))) || 'en';
+  var renderDir = (langs[renderLang] && langs[renderLang].direction === 'rtl') ? 'rtl' : 'ltr';
+%>
 <!doctype html>
-<html>
+<html lang="<%=renderLang%>" dir="<%=renderDir%>">
 
         <title><%=settings.title%></title>
+<%- typeof socialMetaHtml !== 'undefined' ? socialMetaHtml : '' %>
         <meta charset="utf-8">
-        <link rel="manifest" href="/manifest.json" />
+        <link rel="manifest" href="<%= typeof proxyPath !== 'undefined' ? proxyPath : '' %>/manifest.json" />
         <meta name="referrer" content="no-referrer">
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
         <link rel="shortcut icon" href="favicon.ico">
@@ -177,6 +184,7 @@
             <h3 data-l10n-id="index.transferSession"></h3>
             <div data-l10n-id="index.transferSessionDescription"></div>
             <button type="button" class="btn-secondary" style="margin-top: 20px" data-l10n-id="index.transferSessionNow"></button>
+            <div id="transfer-session-error" data-l10n-id="index.sessionTransferError" role="alert" aria-live="assertive" style="display: none; color: #b00020; margin-top: 10px;"></div>
 
             <!-- Copy link button -->
             <div style="display: none" id="copy-link-section">
@@ -195,6 +203,7 @@
             </div>
 
             <button data-l10n-id="index.transferSessionTitle" id="transferSessionButton" disabled></button>
+            <div id="receive-session-error" data-l10n-id="index.sessionTransferError" role="alert" aria-live="assertive" style="display: none; color: #b00020; margin-top: 10px;"></div>
           </div>
 
           <div>
@@ -241,5 +250,5 @@
         <% e.begin_block("indexCustomScripts"); %>
         <script src="static/skins/<%=encodeURI(settings.skinName)%>/index.js?v=<%=settings.randomVersionString%>"></script>
         <% e.end_block(); %>
-        <div style="display:none"><a href="/javascript" data-jslicense="1">JavaScript license information</a></div>
+        <div style="display:none"><a href="<%= typeof proxyPath !== 'undefined' ? proxyPath : '' %>/javascript" data-jslicense="1">JavaScript license information</a></div>
 </html>

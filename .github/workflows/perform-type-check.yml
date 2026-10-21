@@ -24,27 +24,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
-      - uses: actions/cache@v5
-        name: Setup gnpm cache
-        if: always()
+        uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        name: Cache pnpm store
         with:
-          path: |
-            ${{ env.STORE_PATH }}
-            ~/.local/share/gnpm
-            ~/.cache/ms-playwright
-            /usr/local/bin/gnpm
-            /usr/local/bin/gnpm-0.0.12
-          key: ${{ runner.os }}-gnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          path: ${{ env.PNPM_HOME }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
           restore-keys: |
-            ${{ runner.os }}-gnpm-store-
-      - name: Setup gnpm
-        uses: SamTV12345/gnpm-setup@main
+            ${{ runner.os }}-pnpm-store-
+      - uses: pnpm/action-setup@v6.1.0
+        name: Install pnpm
         with:
-          version: 0.0.12
-      -
-        name: Install all dependencies and symlink for ep_etherpad-lite
-        run: gnpm install --frozen-lockfile
+          run_install: false
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install all dependencies and symlink for ep_etherpad-lite
+        run: pnpm install --frozen-lockfile
       - name: Perform type check
         working-directory: ./src
-        run: gnpm run ts-check
+        run: pnpm run ts-check

@@ -17,6 +17,7 @@
     "test": "pnpm --filter ep_etherpad-lite run test",
     "test-utils": "pnpm --filter ep_etherpad-lite run test-utils",
     "test-container": "pnpm --filter ep_etherpad-lite run test-container",
+    "test-container-readonly": "node --test src/tests/container/readonly-root.mjs",
     "dev": "pnpm --filter ep_etherpad-lite run dev",
     "prod": "pnpm --filter ep_etherpad-lite run prod",
     "ts-check": "pnpm --filter ep_etherpad-lite run ts-check",
@@ -42,13 +43,15 @@
     "ui": "link:ui"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.0.0",
+    "pnpm": ">=12.0.0"
   },
+  "packageManager": "pnpm@12.4.2",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ether/etherpad-lite.git"
+    "url": "https://github.com/ether/etherpad.git"
   },
   "engineStrict": true,
-  "version": "2.6.0",
+  "version": "3.3.8",
   "license": "Apache-2.0"
 }

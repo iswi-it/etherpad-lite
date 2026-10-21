@@ -22,56 +22,54 @@ jobs:
     if: |
       (github.event_name != 'pull_request')
       || (github.event.pull_request.head.repo.id != github.event.pull_request.base.repo.id)
-    name: Linux with Plugins
+    # Distinct from Backend tests' "Linux with Plugins", a required check on develop.
+    name: Upgrade from release with Plugins
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24]
+        # Etherpad requires Node >= 24 (see package.json engines.node).
+        node: ${{ fromJSON('[24]') }}
     steps:
       -
         name: Check out latest release
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
-          ref: develop #FIXME change to master when doing release
-      - uses: actions/cache@v5
-        name: Setup gnpm cache
-        if: always()
-        with:
-          path: |
-            ${{ env.STORE_PATH }}
-            ~/.local/share/gnpm
-            ~/.cache/ms-playwright
-            /usr/local/bin/gnpm
-            /usr/local/bin/gnpm-0.0.12
-          key: ${{ runner.os }}-gnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-gnpm-store-
-      - name: Setup gnpm
-        uses: SamTV12345/gnpm-setup@main
-        with:
-          version: 0.0.12
-      - name: Install libreoffice
-        uses: awalsh128/cache-apt-pkgs-action@v1.6.0
-        with:
-          packages: libreoffice libreoffice-pdfimport
-          version: 1.0
+          fetch-depth: 0
       -
-        name: Install libreoffice
-        uses: awalsh128/cache-apt-pkgs-action@v1.6.0
+        name: Check out latest release tag
+        run: git checkout "$(git tag --list 'v*' --sort=-version:refname | head -n1)"
+      - uses: actions/cache@v6
+        name: Cache pnpm store
+        with:
+          path: ${{ env.PNPM_HOME }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+      - uses: pnpm/action-setup@v6.1.0
+        name: Install pnpm
+        with:
+          run_install: false
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - name: Install libreoffice
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.3
         with:
           packages: libreoffice libreoffice-pdfimport
           version: 1.0
       -
         name: Install all dependencies and symlink for ep_etherpad-lite
-        run: gnpm install --frozen-lockfile --runtimeVersion="${{ matrix.node }}"
+        run: pnpm install --frozen-lockfile
       - name: Build admin ui
         working-directory: admin
-        run: gnpm build --runtimeVersion="${{ matrix.node }}"
+        run: pnpm build
       -
         name: Install Etherpad plugins
         run: >
-          gnpm run install-plugins
+          pnpm run install-plugins
           ep_align
           ep_author_hover
           ep_cursortrace
@@ -79,24 +77,21 @@ jobs:
           ep_hash_auth
           ep_headings2
           ep_markdown
-          ep_readonly_guest
+          ep_guest
           ep_set_title_on_pad
           ep_spellcheck
           ep_subscript_and_superscript
-          ep_table_of_contents --runtimeVersion="${{ matrix.node }}"
+          ep_table_of_contents
       -
         name: Run the backend tests
-        run: gnpm run test --runtimeVersion="${{ matrix.node }}"
+        run: pnpm run test
       -
         name: Install all dependencies and symlink for ep_etherpad-lite
-        run: gnpm install --frozen-lockfile --runtimeVersion="${{ matrix.node }}"
-      # Because actions/checkout@v6 is called with "ref: master" and without
-      # "fetch-depth: 0", the local clone does not have the ${GITHUB_SHA}
-      # commit. Fetch ${GITHUB_REF} to get the ${GITHUB_SHA} commit. Note that a
-      # plain "git fetch" only fetches "normal" references (refs/heads/* and
-      # refs/tags/*), and for pull requests none of the normal references
-      # include ${GITHUB_SHA}, so we have to explicitly tell Git to fetch
-      # ${GITHUB_REF}.
+        run: pnpm install --frozen-lockfile
+      # The job starts from the latest release tag, so fetch the pull-request
+      # ref explicitly before checking out ${GITHUB_SHA}. A plain "git fetch"
+      # only brings "normal" references (refs/heads/* and refs/tags/*), and for
+      # pull requests none of those include the synthetic merge commit.
       -
         name: Fetch the new Git commits
         run: git fetch --depth=1 origin "${GITHUB_REF}"
@@ -106,4 +101,4 @@ jobs:
         # commit that merges the PR's source branch to its destination branch.
         run: git checkout "${GITHUB_SHA}"
       - name: Run the backend tests
-        run: gnpm run test --runtimeVersion="${{ matrix.node }}"
+        run: pnpm run test

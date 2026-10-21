@@ -2,6 +2,7 @@
 
 import {MapArrayType} from "../../../node/types/MapType";
 
+const assert = require('assert').strict;
 const common = require('../common');
 const padManager = require('../../../node/db/PadManager');
 import settings from '../../../node/utils/Settings';
@@ -21,8 +22,1000 @@ describe(__filename, function () {
   });
 
   it('returns 500 on export error', async function () {
-    settings.soffice = 'false'; // '/bin/false' doesn't work on Windows
+    // With soffice configured but pointing at a binary that fails, the
+    // legacy convert path errors and the route returns 500. .doc has no
+    // native fallback (it stays soffice-only), so this exercises the
+    // soffice error path even after #7538.
+    settings.soffice = '/bin/false';
     await agent.get('/p/testExportPad/export/doc')
         .expect(500);
+  });
+
+  // Issue #7538: in-process DOCX export via html-to-docx bypasses the
+  // soffice requirement entirely. A deployment with `soffice: null`
+  // should still produce a working .docx via the native path.
+  describe('native DOCX export (#7538)', function () {
+    before(function () {
+      // The upgrade-from-latest-release CI job installs deps from the
+      // PREVIOUS release's package.json (before this PR adds html-to-docx)
+      // and then git-checkouts this branch's code without re-running
+      // `pnpm install`. Under that workflow the module isn't resolvable.
+      // Skip the block in that one case; regular backend tests (which
+      // install against this branch's lockfile) still exercise it.
+      try {
+        require.resolve('html-to-docx');
+      } catch {
+        this.skip();
+        return;
+      }
+      settings.soffice = null;
+    });
+
+    it('returns a valid DOCX archive (PK zip signature)', async function () {
+      const res = await agent.get('/p/testExportPad/export/docx')
+          .buffer(true)
+          .parse((resp: any, callback: any) => {
+            const chunks: Buffer[] = [];
+            resp.on('data', (chunk: Buffer) => chunks.push(chunk));
+            resp.on('end', () => callback(null, Buffer.concat(chunks)));
+          })
+          .expect(200);
+      const body: Buffer = res.body as Buffer;
+      assert.ok(body.length > 0, 'DOCX body must not be empty');
+      // Word .docx files are ZIP archives — must start with the ZIP local
+      // file header signature 0x504b0304 ("PK\x03\x04").
+      assert.strictEqual(body[0], 0x50, 'byte 0 (P)');
+      assert.strictEqual(body[1], 0x4b, 'byte 1 (K)');
+      assert.strictEqual(body[2], 0x03, 'byte 2');
+      assert.strictEqual(body[3], 0x04, 'byte 3');
+    });
+
+    it('sends the Word-processing-ml content-type', async function () {
+      const res = await agent.get('/p/testExportPad/export/docx').expect(200);
+      assert.match(res.headers['content-type'],
+          /application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document/,
+          `unexpected content-type: ${res.headers['content-type']}`);
+    });
+  });
+
+  describe('native PDF export (#7538)', function () {
+    before(function () {
+      try {
+        require.resolve('pdfkit');
+        require.resolve('htmlparser2');
+      } catch {
+        this.skip();
+        return;
+      }
+      settings.soffice = null;
+    });
+
+    it('returns a valid %PDF- document', async function () {
+      const res = await agent.get('/p/testExportPad/export/pdf')
+          .buffer(true)
+          .parse((resp: any, callback: any) => {
+            const chunks: Buffer[] = [];
+            resp.on('data', (chunk: Buffer) => chunks.push(chunk));
+            resp.on('end', () => callback(null, Buffer.concat(chunks)));
+          })
+          .expect(200);
+      const body: Buffer = res.body as Buffer;
+      assert.ok(body.length > 200, 'PDF body must be non-trivial');
+      assert.strictEqual(body.slice(0, 5).toString('ascii'), '%PDF-');
+    });
+
+    it('sends application/pdf content-type', async function () {
+      const res = await agent.get('/p/testExportPad/export/pdf').expect(200);
+      assert.match(res.headers['content-type'], /application\/pdf/);
+    });
+  });
+
+  describe('odt without soffice (#7538)', function () {
+    before(function () { settings.soffice = null; });
+    it('returns the "not enabled" message for odt', async function () {
+      const res = await agent.get('/p/testExportPad/export/odt').expect(200);
+      assert.match(res.text, /This export is not enabled/);
+    });
+  });
+
+  describe('sanitizeExportHtml', function () {
+    const {sanitizeExportHtml} = require('../../../node/utils/ExportSanitizeHtml');
+
+    // The export document is handed to a converter that runs server-side and
+    // dereferences subresource URLs, so every one of these would be a request
+    // issued from the server. The list is deliberately broad: the point of the
+    // value-based check is that it does not depend on knowing the attribute
+    // name, so a carrier nobody enumerated here is still denied.
+    const mustNotSurvive: [string, string][] = [
+      ['plain remote src', '<img src="http://evil.example/a.png">'],
+      ['leading space defeats an anchored scheme test',
+        '<img src=" http://evil.example/a.png">'],
+      ['leading tab', '<img src="\thttp://evil.example/a.png">'],
+      ['leading newline', '<img src="\nhttp://evil.example/a.png">'],
+      ['entity-encoded leading space',
+        '<img src="&#32;http://evil.example/a.png">'],
+      ['hex-entity-encoded leading space',
+        '<img src="&#x20;http://evil.example/a.png">'],
+      ['entity-encoded scheme colon',
+        '<img src="http&colon;//evil.example/a.png">'],
+      ['uppercase scheme', '<img src="HTTP://evil.example/a.png">'],
+      ['protocol-relative', '<img src="//evil.example/a.png">'],
+      ['non-http scheme', '<img src="ftp://evil.example/a.png">'],
+      ['srcset', '<img srcset="http://evil.example/a.png 1x">'],
+      ['remote candidate hidden behind a local one in srcset',
+        '<img srcset="/ok.png 1x, http://evil.example/a.png 2x">'],
+      ['video src', '<video src="http://evil.example/a.mp4"></video>'],
+      ['video poster', '<video poster="http://evil.example/a.png"></video>'],
+      ['source srcset',
+        '<picture><source srcset="http://evil.example/a.png"></picture>'],
+      ['audio src', '<audio src="http://evil.example/a.mp3"></audio>'],
+      ['object data', '<object data="http://evil.example/a.svg"></object>'],
+      ['embed src', '<embed src="http://evil.example/a.swf">'],
+      ['iframe src', '<iframe src="http://evil.example/a"></iframe>'],
+      ['link stylesheet',
+        '<link rel="stylesheet" href="http://evil.example/a.css">'],
+      ['url() in a style attribute',
+        '<p style="background-image:url(http://evil.example/a.png)">x</p>'],
+      ['CSS-escaped url() in a style attribute',
+        '<p style="background:\\75 rl(http://evil.example/a.png)">x</p>'],
+      ['url() in a style block',
+        '<style>body{background:url(http://evil.example/a.png)}</style>'],
+      ['@import in a style block',
+        '<style>@import "http://evil.example/a.css";</style>'],
+      ['inline SVG image href',
+        '<svg><image href="http://evil.example/a.png"></image></svg>'],
+      ['input type=image', '<input type="image" src="http://evil.example/a.png">'],
+      ['table background attribute',
+        '<table background="http://evil.example/a.png"></table>'],
+      ['script body', '<script>fetch("http://evil.example/")</script>'],
+      // Percent-escapes decode INTO the ignored range, so stripping only
+      // before percent-decoding leaves the scheme test looking at a string
+      // that still starts with whitespace. (Qodo review on #8154.)
+      ['percent-encoded leading space',
+        '<img src="%20http://evil.example/a.png">'],
+      ['percent-encoded leading tab',
+        '<img src="%09http://evil.example/a.png">'],
+      ['percent-encoded leading newline',
+        '<img src="%0ahttp://evil.example/a.png">'],
+      // A CSS parser resolves escapes and comments before it sees a token, so
+      // neither spelling of `url(` may survive in a <style> block.
+      ['CSS-escaped url() in a style block',
+        '<style>body{background:\\75 rl(http://evil.example/a.png)}</style>'],
+      ['comment-split url() in a style block',
+        '<style>body{background:u/**/rl(http://evil.example/a.png)}</style>'],
+      ['comment-split url() in a style attribute',
+        '<p style="background:u/**/rl(http://evil.example/a.png)">x</p>'],
+      ['CSS-escaped @import in a style block',
+        '<style>\\40 import "http://evil.example/a.css";</style>'],
+    ];
+
+    for (const [name, html] of mustNotSurvive) {
+      it(`drops a remote URL in: ${name}`, function () {
+        assert.doesNotMatch(sanitizeExportHtml(html), /evil\.example/);
+      });
+    }
+
+    it('drops <base>, which would make every relative URL remote', function () {
+      const out = sanitizeExportHtml('<base href="http://evil.example/"><img src="a.png">');
+      assert.doesNotMatch(out, /evil\.example/);
+      assert.doesNotMatch(out, /<base/);
+      // The relative image is still fine — it is <base> that made it dangerous.
+      assert.match(out, /<img src="a\.png">/);
+    });
+
+    it('drops paths that climb out of the converter working directory', function () {
+      // soffice resolves relative URLs against the temp export dir and
+      // html-to-docx readFileSync(path.resolve(src))s them against the cwd.
+      assert.doesNotMatch(
+          sanitizeExportHtml('<img src="../../../../etc/shadow.png">'), /shadow/);
+      assert.doesNotMatch(
+          sanitizeExportHtml('<img src="%2e%2e/%2e%2e/etc/shadow.png">'), /shadow/);
+    });
+
+    it('drops a non-navigational scheme from <a href>', function () {
+      const out = sanitizeExportHtml('<a href="javascript:alert(1)">x</a>');
+      assert.doesNotMatch(out, /javascript:/i);
+      assert.match(out, /x/);
+    });
+
+    it('drops a non-navigational scheme hidden behind percent-encoded space',
+        function () {
+          const out = sanitizeExportHtml('<a href="%20javascript:alert(1)">x</a>');
+          assert.doesNotMatch(out, /javascript/i);
+          assert.match(out, /x/);
+        });
+
+    it('keeps a style block whose escapes are legitimate CSS strings',
+        function () {
+          // `\201C` is a smart quote in `content:` — decoding it into the
+          // emitted CSS would break the declaration, so detection runs on a
+          // copy and the original text is what ships.
+          const css = '<style>q:before{content:"\\201C"}</style>';
+          assert.match(sanitizeExportHtml(css), /\\201C/);
+        });
+
+    it('keeps ordinary hyperlinks — converters do not dereference them',
+        function () {
+          const out = sanitizeExportHtml('<a href="https://example.com/x">link</a>');
+          assert.match(out, /href="https:\/\/example\.com\/x"/);
+          assert.match(out, /link/);
+        });
+
+    it('keeps mailto: links', function () {
+      assert.match(sanitizeExportHtml('<a href="mailto:a@b.co">m</a>'), /mailto:a@b\.co/);
+    });
+
+    it('keeps the manifest <link> the export template emits', function () {
+      const out = sanitizeExportHtml('<link rel="manifest" href="/manifest.json"/>');
+      assert.match(out, /manifest\.json/);
+    });
+
+    it('keeps the style attributes ep_align and core lists emit', function () {
+      assert.match(
+          sanitizeExportHtml('<p style="text-align:center">x</p>'), /text-align:center/);
+      assert.match(
+          sanitizeExportHtml('<ul style="list-style-type: none;"></ul>'),
+          /list-style-type/);
+    });
+
+    it('keeps the author-colour and list-counter CSS in the export head',
+        function () {
+          const css = '<style>.authorA {background-color: #fff}\n' +
+              'ol > li:before{content:counters(item, ".") ". ";}</style>';
+          const out = sanitizeExportHtml(css);
+          assert.match(out, /background-color: #fff/);
+          assert.match(out, /counters\(item/);
+          // CSS must not come back HTML-escaped or the block stops parsing.
+          assert.doesNotMatch(out, /&gt;/);
+        });
+
+    it('keeps the charset declaration', function () {
+      assert.match(sanitizeExportHtml('<meta charset="utf-8"/>'), /charset="utf-8"/);
+    });
+
+    it('keeps data: URIs', function () {
+      const out = sanitizeExportHtml(
+          '<p>x</p><img src="data:image/png;base64,iVBORw0KGgo=">');
+      assert.match(out, /<img[^>]+src="data:image\/png/);
+    });
+
+    it('keeps relative URLs', function () {
+      const out = sanitizeExportHtml('<img src="/foo/bar.png">');
+      assert.match(out, /<img[^>]+src="\/foo\/bar\.png"/);
+    });
+
+    it('drops absolute http(s) URLs and falls back to alt', function () {
+      const out = sanitizeExportHtml(
+          '<p>before<img src="https://evil.example/x.png" alt="cat">after</p>');
+      assert.doesNotMatch(out, /evil\.example/);
+      assert.match(out, /before/);
+      assert.match(out, /cat/);
+      assert.match(out, /after/);
+    });
+
+    it('drops protocol-relative URLs', function () {
+      const out = sanitizeExportHtml('<img src="//evil.example/x.png">');
+      assert.doesNotMatch(out, /evil\.example/);
+    });
+
+    it('passes non-image markup through unchanged', function () {
+      const html = '<h1>hi</h1><p>body <a href="/x">link</a></p>';
+      assert.strictEqual(sanitizeExportHtml(html), html);
+    });
+
+    it('preserves the doctype directive (soffice reads a full document)', function () {
+      const html = '<!doctype html><html><body><p>hi</p></body></html>';
+      const out = sanitizeExportHtml(html);
+      assert.match(out, /<!doctype html>/i);
+    });
+
+    it('preserves HTML comments', function () {
+      const html = '<body><!-- keep me --><p>hi</p></body>';
+      const out = sanitizeExportHtml(html);
+      assert.match(out, /<!-- keep me -->/);
+    });
+
+    it('preserves the doctype while still dropping a remote image', function () {
+      const html =
+          '<!doctype html><html><body><img src="https://evil.example/x.png" alt="a"></body></html>';
+      const out = sanitizeExportHtml(html);
+      assert.match(out, /<!doctype html>/i);
+      assert.doesNotMatch(out, /evil\.example/);
+    });
+  });
+
+  describe('extractBody', function () {
+    const {extractBody} = require('../../../node/utils/ExportSanitizeHtml');
+
+    it('returns trimmed body content from a full document', function () {
+      const html = `<!doctype html><html><head><style>.x{color:red}</style></head><body>
+hello<br>world
+</body></html>`;
+      assert.strictEqual(extractBody(html), 'hello<br>world');
+    });
+
+    it('passes a body-less fragment through unchanged', function () {
+      const html = '<p>just a fragment</p>';
+      assert.strictEqual(extractBody(html), html);
+    });
+
+    it('drops <head><style> contents', function () {
+      const html = '<html><head><style>.x{}</style></head><body><p>kept</p></body></html>';
+      const out = extractBody(html);
+      assert.doesNotMatch(out, /style/);
+      assert.doesNotMatch(out, /\.x/);
+      assert.match(out, /kept/);
+    });
+  });
+
+  describe('wrapLooseLines', function () {
+    const {wrapLooseLines} = require('../../../node/utils/ExportSanitizeHtml');
+
+    it('wraps loose text in <p>', function () {
+      assert.strictEqual(wrapLooseLines('Hello'), '<p>Hello</p>');
+    });
+
+    it('keeps single <br> as soft break inside one paragraph', function () {
+      assert.strictEqual(wrapLooseLines('A<br>B'), '<p>A<br>B</p>');
+    });
+
+    it('splits paragraphs on consecutive <br>', function () {
+      // Two <br>s between content: one paragraph break + one empty
+      // <p></p> marker so the blank pad line survives a DOCX round-trip
+      // through html-to-docx and mammoth.
+      assert.strictEqual(wrapLooseLines('A<br><br>B'),
+          '<p>A</p><p></p><p>B</p>');
+    });
+
+    it('emits more empty <p> markers for longer <br> runs', function () {
+      // Three <br>s = 2 blank pad lines between content.
+      assert.strictEqual(wrapLooseLines('A<br><br><br>B'),
+          '<p>A</p><p></p><p></p><p>B</p>');
+    });
+
+    it('drops trailing <br>', function () {
+      assert.strictEqual(wrapLooseLines('Foo<br>'), '<p>Foo</p>');
+    });
+
+    it('leaves block elements alone', function () {
+      const html = '<ul><li>x</li></ul>';
+      assert.strictEqual(wrapLooseLines(html), html);
+    });
+
+    it('handles realistic etherpad pad HTML', function () {
+      const out = wrapLooseLines(
+          'Welcome!<br><br>Body text.<br>More text.<br>');
+      // <br><br> -> blank-line marker between Welcome and Body text;
+      // single <br> in the second chunk stays as a soft break;
+      // trailing <br> is dropped.
+      assert.strictEqual(out,
+          '<p>Welcome!</p><p></p><p>Body text.<br>More text.</p>');
+    });
+  });
+
+  describe('dropEmptyBlocks', function () {
+    const {dropEmptyBlocks} = require('../../../node/utils/ExportSanitizeHtml');
+
+    it('drops empty heading blocks', function () {
+      const out = dropEmptyBlocks(
+          "<h1 style='text-align:right'>Hi</h1><br><h1 style='text-align:right'></h1><br>x");
+      assert.strictEqual(out, "<h1 style='text-align:right'>Hi</h1><br><br>x");
+    });
+
+    it('drops empty code blocks', function () {
+      assert.strictEqual(dropEmptyBlocks('<code></code>x'), 'x');
+      assert.strictEqual(
+          dropEmptyBlocks('<code style="x">  \n\t  </code>x'), 'x');
+    });
+
+    it('iterates so nested empties are dropped too', function () {
+      // <code></code> inside a <div> -> div becomes empty -> div drops too.
+      // (<p></p> is preserved on purpose; wrapLooseLines uses it as a
+      // blank-line marker for DOCX round-trip fidelity.)
+      const out = dropEmptyBlocks('<div><code></code></div>after');
+      assert.strictEqual(out, 'after');
+    });
+
+    it('does not drop empty <p></p> (blank-line marker)', function () {
+      const out = dropEmptyBlocks('<p>x</p><p></p><p>y</p>');
+      assert.strictEqual(out, '<p>x</p><p></p><p>y</p>');
+    });
+
+    it('keeps non-empty blocks unchanged', function () {
+      const html = '<h1>Hi</h1><p>body</p><code>x = 1</code>';
+      assert.strictEqual(dropEmptyBlocks(html), html);
+    });
+  });
+
+  describe('collapseRedundantBrAfterBlocks', function () {
+    const {collapseRedundantBrAfterBlocks} =
+        require('../../../node/utils/ExportSanitizeHtml');
+
+    it('drops <br> immediately after a closing <p>', function () {
+      assert.strictEqual(
+          collapseRedundantBrAfterBlocks('<p>x</p><br><p>y</p>'),
+          '<p>x</p><p>y</p>');
+    });
+
+    it('drops <br> after closing heading and code tags', function () {
+      for (const tag of ['h1', 'h2', 'h3', 'code', 'pre', 'div', 'blockquote']) {
+        assert.strictEqual(
+            collapseRedundantBrAfterBlocks(`<${tag}>x</${tag}><br>`),
+            `<${tag}>x</${tag}>`,
+            `expected </${tag}><br> collapsed`);
+      }
+    });
+
+    it('keeps a standalone <br> between text', function () {
+      const html = 'Hello<br>World';
+      assert.strictEqual(collapseRedundantBrAfterBlocks(html), html);
+    });
+
+    it('handles whitespace between </tag> and <br>', function () {
+      assert.strictEqual(
+          collapseRedundantBrAfterBlocks('<p>x</p>  \n<br>after'),
+          '<p>x</p>after');
+    });
+
+    it('drops only one <br>, leaving any subsequent ones', function () {
+      // <br><br> after a closing block represents (one redundant + one
+      // intentional blank-line break). After collapsing the first, the
+      // second remains.
+      assert.strictEqual(
+          collapseRedundantBrAfterBlocks('<p>x</p><br><br><p>y</p>'),
+          '<p>x</p><br><p>y</p>');
+    });
+  });
+
+  describe('separateAdjacentHeadingBlocks', function () {
+    const {separateAdjacentHeadingBlocks} =
+        require('../../../node/utils/ExportSanitizeHtml');
+
+    it('inserts <br> between adjacent <h1> and <h2>', function () {
+      assert.strictEqual(
+          separateAdjacentHeadingBlocks('<h1>A</h1><h2>B</h2>'),
+          '<h1>A</h1><br><h2>B</h2>');
+    });
+
+    it('inserts <br> between adjacent <code> blocks', function () {
+      assert.strictEqual(
+          separateAdjacentHeadingBlocks('<code>A</code><code>B</code>'),
+          '<code>A</code><br><code>B</code>');
+    });
+
+    it('inserts <br> after a heading before a <p>', function () {
+      assert.strictEqual(
+          separateAdjacentHeadingBlocks('<h1>A</h1><p>B</p>'),
+          '<h1>A</h1><br><p>B</p>');
+    });
+
+    it('does not change adjacent <p> elements', function () {
+      const html = '<p>A</p><p>B</p>';
+      assert.strictEqual(separateAdjacentHeadingBlocks(html), html);
+    });
+
+    it('handles three-block round-trip case', function () {
+      // Mirrors what mammoth produces for a pad with H1 + H2 + Code.
+      assert.strictEqual(
+          separateAdjacentHeadingBlocks(
+              '<h1>Welcome</h1><h2>This pad</h2><p>Code line</p>'),
+          '<h1>Welcome</h1><br><h2>This pad</h2><br><p>Code line</p>');
+    });
+  });
+
+  describe('applyMonospaceToCode', function () {
+    const {applyMonospaceToCode} =
+        require('../../../node/utils/ExportSanitizeHtml');
+
+    it('emits a Courier span for inline <code>', function () {
+      // The <code> tag itself is dropped (html-to-docx ignores it and
+      // also breaks <a> children when they're nested inside it). The
+      // text becomes a Courier-styled inline span.
+      const out = applyMonospaceToCode('<code>x = 1</code>');
+      assert.strictEqual(out,
+          `<span style="font-family:'Courier New', monospace">x = 1</span>`);
+    });
+
+    it('forwards block-level style to a wrapping <p>', function () {
+      // ep_headings2 + ep_align emit `<code style='text-align:right'>`
+      // for each "Code"-styled pad line. The alignment must reach
+      // html-to-docx as a paragraph property, so we move the style
+      // onto a wrapping <p>.
+      const out = applyMonospaceToCode("<code style='text-align:right'>x</code>");
+      assert.match(out, /<p style="text-align:right">/);
+      assert.match(out, /font-family:'Courier New'/);
+    });
+
+    it('emits <p> wrap for <pre> regardless of style', function () {
+      // <pre> is always block-level.
+      const out = applyMonospaceToCode('<pre>preformatted</pre>');
+      assert.match(out, /^<p>/);
+      assert.match(out, /<\/p>$/);
+      assert.match(out, /font-family:'Courier New'/);
+    });
+
+    it('handles inline <tt>, <kbd>, <samp> as bare spans', function () {
+      for (const tag of ['tt', 'kbd', 'samp']) {
+        const out = applyMonospaceToCode(`<${tag}>x</${tag}>`);
+        assert.strictEqual(out,
+            `<span style="font-family:'Courier New', monospace">x</span>`,
+            `expected styled span (no ${tag} wrapper) but got: ${out}`);
+      }
+    });
+
+    it('does not touch unrelated tags', function () {
+      const html = '<p>plain</p><strong>bold</strong>';
+      assert.strictEqual(applyMonospaceToCode(html), html);
+    });
+
+    it('does not wrap <a> elements in the Courier span', function () {
+      // Regression: html-to-docx drops <a href> content when nested
+      // inside a styled span OR inside <code>. We split on anchors
+      // and leave them unstyled.
+      const out = applyMonospaceToCode(
+          '<code>Github: <a href="https://github.com/ether/etherpad">link</a> end</code>');
+      // Anchor is preserved as-is (no Courier span around it)
+      assert.match(out, /<a href="https:\/\/github\.com\/ether\/etherpad">link<\/a>/);
+      // Text before the anchor is wrapped
+      assert.match(out, /font-family:'Courier New', monospace">Github: <\/span>/);
+      // Text after the anchor is wrapped
+      assert.match(out, /font-family:'Courier New', monospace"> end<\/span>/);
+      // <code> wrapper is dropped
+      assert.doesNotMatch(out, /<code/);
+      assert.doesNotMatch(out, /<\/code>/);
+    });
+
+    it('preserves <a> through html-to-docx round-trip', async function () {
+      try { require.resolve('html-to-docx'); }
+      catch { this.skip(); return; }
+      const htmlToDocx = require('html-to-docx');
+      const JSZip = require('jszip');
+      const buf: Buffer = await htmlToDocx(applyMonospaceToCode(
+          '<p><code>Github: <a href="https://github.com/ether/etherpad">site</a></code></p>'));
+      const z = await JSZip.loadAsync(buf);
+      const xml: string = await z.file('word/document.xml').async('text');
+      // Anchor must survive: docx hyperlinks live in <w:hyperlink>
+      assert.match(xml, /<w:hyperlink/, 'expected <w:hyperlink> in docx');
+      assert.match(xml, /<w:t[^>]*>site<\/w:t>/, 'expected link text "site"');
+      const rels: string = await z.file('word/_rels/document.xml.rels')
+          .async('text');
+      assert.match(rels, /github\.com\/ether\/etherpad/,
+          'expected URL in document.xml.rels');
+    });
+  });
+
+  describe('htmlToPdfBuffer', function () {
+    let htmlToPdfBuffer: (html: string) => Promise<Buffer>;
+
+    before(function () {
+      try {
+        require.resolve('pdfkit');
+        require.resolve('htmlparser2');
+      } catch {
+        this.skip();
+        return;
+      }
+      htmlToPdfBuffer = require('../../../node/utils/ExportPdfNative').htmlToPdfBuffer;
+    });
+
+    it('produces a buffer starting with %PDF-', async function () {
+      const buf = await htmlToPdfBuffer('<p>hello world</p>');
+      assert.ok(Buffer.isBuffer(buf), 'must return Buffer');
+      assert.ok(buf.length > 100, `buffer suspiciously small: ${buf.length} bytes`);
+      assert.strictEqual(buf.slice(0, 5).toString('ascii'), '%PDF-');
+    });
+
+    // pdfkit emits visible text as hex strings inside TJ operators
+    // (e.g. `Title` -> `<5469746c65>`), and pdfkit splits a single text
+    // run into multiple chunks at kerning boundaries. Decode every hex
+    // string we find and concatenate the result so substring matching
+    // works on the visible text content.
+    const decodeVisibleText = (raw: string): string => {
+      const out: string[] = [];
+      const re = /<([0-9a-fA-F]{2,})>/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(raw)) !== null) {
+        try {
+          out.push(Buffer.from(m[1], 'hex').toString('latin1'));
+        } catch { /* not hex; ignore */ }
+      }
+      return out.join('');
+    };
+
+    const renderText = async (html: string): Promise<string> => {
+      const buf = await htmlToPdfBuffer(html);
+      return buf.toString('latin1');
+    };
+
+    it('renders headings, paragraphs, and lists', async function () {
+      const raw = await renderText(`
+        <h1>Title</h1>
+        <p>Body paragraph here.</p>
+        <ul><li>one</li><li>two</li></ul>
+        <ol><li>alpha</li><li>beta</li></ol>
+      `);
+      const visible = decodeVisibleText(raw);
+      assert.ok(visible.includes('Title'), `expected Title in: ${visible}`);
+      assert.ok(visible.includes('Body paragraph here.'),
+          `expected paragraph in: ${visible}`);
+      assert.ok(visible.includes('one'), `expected "one" in: ${visible}`);
+      assert.ok(visible.includes('two'), `expected "two" in: ${visible}`);
+      assert.ok(visible.includes('alpha'), `expected "alpha" in: ${visible}`);
+      assert.ok(visible.includes('beta'), `expected "beta" in: ${visible}`);
+    });
+
+    it('emits link annotations for <a href>', async function () {
+      const raw = await renderText('<p><a href="https://etherpad.org">site</a></p>');
+      const visible = decodeVisibleText(raw);
+      assert.ok(visible.includes('site'), `expected "site" in: ${visible}`);
+      // URL is stored in a /URI dict as a plain (parenthesized) string.
+      // Match the full /URI (...) form so we're verifying the PDF link
+      // annotation structure, not just any occurrence of the host string.
+      assert.match(raw, /\/URI\s*\(https:\/\/etherpad\.org\)/,
+          'expected link target URL in PDF /URI dict');
+    });
+
+    it('embeds data: URI images without throwing', async function () {
+      const tinyPng =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+      const buf = await htmlToPdfBuffer(`<img src="data:image/png;base64,${tinyPng}">`);
+      assert.ok(buf.length > 200);
+    });
+
+    it('ignores unknown tags rather than crashing', async function () {
+      const buf = await htmlToPdfBuffer(
+          '<custom-tag><p>still works</p></custom-tag>');
+      assert.strictEqual(buf.slice(0, 5).toString('ascii'), '%PDF-');
+    });
+
+    it('does not render head/style/script content', async function () {
+      const raw = await renderText(`
+        <html><head>
+          <title>SECRET_TITLE</title>
+          <style>.x { display: SECRET_CSS; }</style>
+          <script>var SECRET_JS = 1;</script>
+        </head><body>
+          <p>visible body</p>
+        </body></html>
+      `);
+      const visible = decodeVisibleText(raw);
+      assert.doesNotMatch(visible, /SECRET_TITLE/);
+      assert.doesNotMatch(visible, /SECRET_CSS/);
+      assert.doesNotMatch(visible, /SECRET_JS/);
+      assert.match(visible, /visible body/);
+    });
+
+    it('honors text-align style on block elements', async function () {
+      // pdfkit emits text-positioning matrices for aligned text. We assert
+      // the alignment option produced different output than left-aligned
+      // by checking the x coordinate of the BT block.
+      const leftRaw = await renderText('<p>aligned text</p>');
+      const rightRaw = await renderText('<p style="text-align:right">aligned text</p>');
+      const leftX = (leftRaw.match(/1 0 0 1 (\d+(?:\.\d+)?)/) || [])[1];
+      const rightX = (rightRaw.match(/1 0 0 1 (\d+(?:\.\d+)?)/) || [])[1];
+      assert.ok(leftX, 'expected left x');
+      assert.ok(rightX, 'expected right x');
+      assert.notStrictEqual(leftX, rightX,
+          `right-aligned text should sit at a different x than left-aligned (left=${leftX} right=${rightX})`);
+    });
+
+    it('uses Courier font inside <code>', async function () {
+      const raw = await renderText('<p>before <code>x = 1</code> after</p>');
+      // pdfkit references the font in the resource dictionary; Courier
+      // isn't in the default resources so its first use creates a new
+      // /Font subtype entry. Look for "Courier" anywhere in the PDF.
+      assert.match(raw, /Courier/);
+    });
+
+    it('uses Courier font inside <pre>', async function () {
+      const raw = await renderText('<pre>preformatted text</pre>');
+      assert.match(raw, /Courier/);
+    });
+
+    it('honors text-align on <code> (ep_headings2 code lines)', async function () {
+      const leftRaw = await renderText('<code>x = 1</code>');
+      const rightRaw = await renderText("<code style='text-align:right'>x = 1</code>");
+      const leftX = (leftRaw.match(/1 0 0 1 (\d+(?:\.\d+)?)/) || [])[1];
+      const rightX = (rightRaw.match(/1 0 0 1 (\d+(?:\.\d+)?)/) || [])[1];
+      assert.ok(leftX, 'expected left x');
+      assert.ok(rightX, 'expected right x');
+      assert.notStrictEqual(leftX, rightX,
+          `right-aligned <code> should sit at a different x than left-aligned (left=${leftX} right=${rightX})`);
+    });
+
+    it('honors text-align on <pre>', async function () {
+      const leftRaw = await renderText('<pre>x = 1</pre>');
+      const rightRaw = await renderText("<pre style='text-align:right'>x = 1</pre>");
+      const leftX = (leftRaw.match(/1 0 0 1 (\d+(?:\.\d+)?)/) || [])[1];
+      const rightX = (rightRaw.match(/1 0 0 1 (\d+(?:\.\d+)?)/) || [])[1];
+      assert.notStrictEqual(leftX, rightX,
+          `right-aligned <pre> should sit at a different x than left-aligned (left=${leftX} right=${rightX})`);
+    });
+
+    // ---------------------------------------------------------------------
+    // Issue #8245: the native PDF path ignored font-family entirely, so any
+    // font a plugin applied (ep_font_family emits
+    // `<span style="font-family:...">` from getLineHTMLForExport) was lost.
+    // ---------------------------------------------------------------------
+    describe('font-family (#8245)', function () {
+      // Every font a PDF draws with is listed as a /BaseFont in a font
+      // dictionary. Reading those names tells us which face pdfkit actually
+      // selected without having to compare rendered pixels. Subset-embedded
+      // fonts carry a six-letter tag prefix (`ABCDEF+Name`), which is
+      // stripped so assertions can name the font.
+      const baseFonts = async (html: string): Promise<string[]> => {
+        const raw = await renderText(html);
+        const names = new Set<string>();
+        const re = /\/BaseFont\s*\/([A-Za-z0-9+#,._-]+)/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(raw)) !== null) {
+          names.add(m[1].replace(/^[A-Z]{6}\+/, ''));
+        }
+        return [...names];
+      };
+
+      it('maps serif, sans-serif and monospace onto distinct built-ins',
+          async function () {
+            const sans = await baseFonts(
+                "<p><span style='font-family:arial'>text</span></p>");
+            const serif = await baseFonts(
+                "<p><span style='font-family:times-new-roman'>text</span></p>");
+            const mono = await baseFonts(
+                "<p><span style='font-family:monospace'>text</span></p>");
+            assert.deepStrictEqual(sans, ['Helvetica']);
+            assert.deepStrictEqual(serif, ['Times-Roman']);
+            assert.deepStrictEqual(mono, ['Courier']);
+          });
+
+      it('maps families with no built-in equivalent by category',
+          async function () {
+            // ep_font_family ships Garamond/Palatino/Bookman (serif) and
+            // Calibri/Avant Garde (sans). None of them is a PDF standard
+            // font, so they render as the nearest built-in category.
+            for (const family of ['garamond', 'palatino', 'bookman']) {
+              assert.deepStrictEqual(
+                  await baseFonts(`<p><span style='font-family:${family}'>t</span></p>`),
+                  ['Times-Roman'], `${family} should render as a serif face`);
+            }
+            for (const family of ['calibri', 'avant-garde']) {
+              assert.deepStrictEqual(
+                  await baseFonts(`<p><span style='font-family:${family}'>t</span></p>`),
+                  ['Helvetica'], `${family} should render as a sans face`);
+            }
+          });
+
+      it('honors bold/italic variants of a mapped family', async function () {
+            assert.deepStrictEqual(
+                await baseFonts("<p><b><span style='font-family:georgia'>t</span></b></p>"),
+                ['Times-Bold']);
+            assert.deepStrictEqual(
+                await baseFonts("<p><i><span style='font-family:georgia'>t</span></i></p>"),
+                ['Times-Italic']);
+            assert.deepStrictEqual(
+                await baseFonts(
+                    "<p><b><i><span style='font-family:georgia'>t</span></i></b></p>"),
+                ['Times-BoldItalic']);
+            assert.deepStrictEqual(
+                await baseFonts(
+                    "<p><b><span style='font-family:courier-new'>t</span></b></p>"),
+                ['Courier-Bold']);
+          });
+
+      it('walks the font-family list and takes the first known family',
+          async function () {
+            assert.deepStrictEqual(
+                await baseFonts(
+                    '<p><span style="font-family:\'Nonexistent Face\', Georgia, serif">' +
+                    't</span></p>'),
+                ['Times-Roman']);
+          });
+
+      it('applies CSS declaration order and !important', async function () {
+            // A style attribute can repeat the declaration; the last one wins
+            // unless an earlier one is flagged !important.
+            assert.deepStrictEqual(
+                await baseFonts(
+                    "<p><span style='font-family:monospace;font-family:georgia'>" +
+                    't</span></p>'),
+                ['Times-Roman'], 'the last declaration should win');
+            assert.deepStrictEqual(
+                await baseFonts(
+                    "<p><span style='font-family:monospace !important;" +
+                    "font-family:georgia'>t</span></p>"),
+                ['Courier'], '!important should beat a later declaration');
+            // The flag itself must not end up in the lookup key.
+            assert.deepStrictEqual(
+                await baseFonts(
+                    "<p><span style='font-family: georgia !important'>t</span></p>"),
+                ['Times-Roman']);
+            assert.deepStrictEqual(
+                await baseFonts(
+                    "<p><span style='text-align:right;font-family:monospace'>" +
+                    't</span></p>'),
+                ['Courier'], 'a preceding declaration must not hide it');
+          });
+
+      it('keeps code/pre monospace when an explicit family is unknown',
+          async function () {
+            // An unresolvable family leaves the element on whatever font it
+            // would otherwise use — Courier for code-like tags, the enclosing
+            // font elsewhere.
+            assert.deepStrictEqual(
+                await baseFonts(
+                    "<p><code style='font-family:Totally Made Up'>x</code></p>"),
+                ['Courier']);
+            assert.deepStrictEqual(
+                await baseFonts(
+                    "<p><span style='font-family:georgia'>" +
+                    "<span style='font-family:Totally Made Up'>t</span></span></p>"),
+                ['Times-Roman']);
+          });
+
+      it('reads font-family from a data attribute too', async function () {
+            // Plugins using exportHtmlAdditionalTagsWithData produce
+            // `<span data-...="value">` rather than an inline style.
+            assert.deepStrictEqual(
+                await baseFonts('<p><span data-font-family="monospace">t</span></p>'),
+                ['Courier']);
+          });
+
+      it('falls back without throwing for an unknown family', async function () {
+            const buf = await htmlToPdfBuffer(
+                "<p><span style='font-family:Totally Made Up Face'>t</span></p>");
+            assert.strictEqual(buf.slice(0, 5).toString('ascii'), '%PDF-');
+            assert.deepStrictEqual(
+                await baseFonts(
+                    "<p><span style='font-family:Totally Made Up Face'>t</span></p>"),
+                ['Helvetica'], 'unknown families should inherit the enclosing font');
+          });
+
+      it('is not fooled by Object.prototype property names', async function () {
+            // Family names come from pad content, so a lookup that used a
+            // plain `in`/property read would report a hit for names like
+            // "constructor" or "toString".
+            for (const family of ['constructor', 'toString', '__proto__',
+              'hasOwnProperty']) {
+              assert.deepStrictEqual(
+                  await baseFonts(`<p><span style='font-family:${family}'>t</span></p>`),
+                  ['Helvetica'], `"${family}" must not resolve to a font`);
+            }
+          });
+
+      it('leaves an unstyled document on the default font', async function () {
+            assert.deepStrictEqual(
+                await baseFonts('<h1>Title</h1><p>Body <b>bold</b> <i>it</i></p>'),
+                ['Helvetica', 'Helvetica-Bold', 'Helvetica-Oblique']);
+            // Tag-driven monospace still works exactly as before.
+            assert.deepStrictEqual(
+                await baseFonts('<p>a <code>x = 1</code></p>'),
+                ['Helvetica', 'Courier']);
+          });
+
+      it('does not let a font-family style leak into the rendered text',
+          async function () {
+            const raw = await renderText(
+                "<p><span style='font-family:garamond'>visible</span></p>");
+            const visible = decodeVisibleText(raw);
+            assert.match(visible, /visible/);
+            assert.doesNotMatch(visible, /garamond/i);
+            assert.doesNotMatch(visible, /font-family/i);
+          });
+
+      describe('exportPdfFonts setting', function () {
+        const {exportedForTesting} =
+            require('../../../node/utils/ExportPdfNative');
+        let fontsBackup: any;
+
+        beforeEach(function () {
+          fontsBackup = settings.exportPdfFonts;
+          exportedForTesting.clearFontCache();
+        });
+
+        afterEach(function () {
+          settings.exportPdfFonts = fontsBackup;
+          exportedForTesting.clearFontCache();
+        });
+
+        it('embeds an operator-registered font file', async function () {
+          // Reuses a font already shipped for the skins rather than adding
+          // one; any readable TTF would do.
+          settings.exportPdfFonts = {
+            Quicksand: {
+              regular: 'src/static/font/Quicksand-Regular.ttf',
+              bold: 'src/static/font/Quicksand-Bold.ttf',
+            },
+          };
+          assert.deepStrictEqual(
+              await baseFonts("<p><span style='font-family:Quicksand'>t</span></p>"),
+              ['Quicksand-Regular']);
+          assert.deepStrictEqual(
+              await baseFonts(
+                  "<p><b><span style='font-family:quicksand'>t</span></b></p>"),
+              ['Quicksand-Bold']);
+          // No italic file configured: degrade to the regular face rather
+          // than dropping the font.
+          assert.deepStrictEqual(
+              await baseFonts(
+                  "<p><i><span style='font-family:QUICKSAND'>t</span></i></p>"),
+              ['Quicksand-Regular']);
+        });
+
+        it('accepts a bare path as the regular face', async function () {
+          settings.exportPdfFonts = {
+            'My Face': 'src/static/font/Quicksand-Regular.ttf',
+          };
+          assert.deepStrictEqual(
+              await baseFonts("<p><span style='font-family:my-face'>t</span></p>"),
+              ['Quicksand-Regular']);
+        });
+
+        it('falls back to the configured built-in when the file is missing',
+            async function () {
+              settings.exportPdfFonts = {
+                Ghost: {regular: '/nonexistent/ghost.ttf', fallback: 'courier'},
+              };
+              const buf = await htmlToPdfBuffer(
+                  "<p><span style='font-family:Ghost'>t</span></p>");
+              assert.strictEqual(buf.slice(0, 5).toString('ascii'), '%PDF-');
+              assert.deepStrictEqual(
+                  await baseFonts("<p><span style='font-family:Ghost'>t</span></p>"),
+                  ['Courier']);
+            });
+
+        it('falls back when the file is not a font', async function () {
+          settings.exportPdfFonts = {Bogus: {regular: 'package.json'}};
+          assert.deepStrictEqual(
+              await baseFonts("<p><span style='font-family:Bogus'>t</span></p>"),
+              ['Helvetica']);
+        });
+
+        it('picks up a font file that appears or changes on disk',
+            async function () {
+              // The font cache keys on mtime+size, so an operator can correct
+              // a wrong path or swap a face in place and the next export uses
+              // it — no restart, and no cached failure to clear.
+              const os = require('os');
+              const fs = require('fs');
+              const path = require('path');
+              const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ep8245-'));
+              const target = path.join(dir, 'face.ttf');
+              const fontDir = path.join(__dirname, '../../../static/font');
+              try {
+                settings.exportPdfFonts = {'Swappable': target};
+                // Nothing there yet: falls back rather than failing.
+                assert.deepStrictEqual(
+                    await baseFonts("<p><span style='font-family:Swappable'>t</span></p>"),
+                    ['Helvetica'], 'a missing file should fall back');
+
+                fs.copyFileSync(path.join(fontDir, 'Quicksand-Regular.ttf'), target);
+                assert.deepStrictEqual(
+                    await baseFonts("<p><span style='font-family:Swappable'>t</span></p>"),
+                    ['Quicksand-Regular'],
+                    'a file appearing at the configured path should be picked up');
+
+                fs.copyFileSync(path.join(fontDir, 'RobotoMono-Regular.ttf'), target);
+                // Guarantee a different mtime even on a coarse-grained clock.
+                const later = new Date(Date.now() + 2000);
+                fs.utimesSync(target, later, later);
+                assert.deepStrictEqual(
+                    await baseFonts("<p><span style='font-family:Swappable'>t</span></p>"),
+                    ['RobotoMono-Regular'],
+                    'a replaced file should not serve the previous bytes');
+              } finally {
+                fs.rmSync(dir, {recursive: true, force: true, maxRetries: 10, retryDelay: 100});
+              }
+            });
+
+        it('overrides the built-in mapping for a known family',
+            async function () {
+              settings.exportPdfFonts = {
+                Arial: 'src/static/font/Quicksand-Regular.ttf',
+              };
+              assert.deepStrictEqual(
+                  await baseFonts("<p><span style='font-family:arial'>t</span></p>"),
+                  ['Quicksand-Regular']);
+            });
+      });
+    });
   });
 });
